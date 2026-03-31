@@ -30,6 +30,7 @@ class TTSEngine:
         self._stop = asyncio.Event()
         self._speaking = False
         self._azure_synthesizer = None  # kept so stop_playback can cancel mid-utterance
+        self._gen = 0  # incremented on stop — invalidates any in-flight speak() call
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -39,8 +40,11 @@ class TTSEngine:
 
     def stop_playback(self) -> None:
         """Request the current utterance to stop as soon as possible."""
+        self._gen += 1
         self._stop.set()
-        # Cancel any in-flight Azure synthesis immediately
+        # Immediately silence any playing audio
+        _stop_wav()
+        # Cancel any in-flight Azure synthesis
         synth = self._azure_synthesizer
         if synth is not None:
             try:
@@ -49,32 +53,37 @@ class TTSEngine:
             except Exception:
                 logger.debug("Could not cancel Azure synthesizer", exc_info=True)
 
+    def _cancelled(self, gen: int) -> bool:
+        """Return True if this speak() call has been superseded."""
+        return self._stop.is_set() or self._gen != gen
+
     async def speak(self, text: str) -> None:
         """Convert *text* to audio and play it.  Blocks until done or stopped."""
+        gen = self._gen  # snapshot — if stop_playback() bumps this, we abort
         self._stop.clear()
         self._speaking = True
         try:
             backend = self._cfg.backend.lower().strip()
             if backend == "azure":
-                await self._speak_azure(text)
+                await self._speak_azure(text, gen)
             elif backend == "openai":
-                await self._speak_openai(text)
+                await self._speak_openai(text, gen)
             else:
-                await self._speak_local(text)
+                await self._speak_local(text, gen)
         finally:
             self._speaking = False
 
     # ── Local backend (pyttsx3 → fallback console) ────────────────────────────
 
-    async def _speak_local(self, text: str) -> None:
+    async def _speak_local(self, text: str, gen: int) -> None:
         try:
             import pyttsx3  # type: ignore[import-untyped]
-            await self._speak_pyttsx3(text, pyttsx3)
+            await self._speak_pyttsx3(text, pyttsx3, gen)
         except ImportError:
             logger.debug("pyttsx3 not installed — falling back to console simulation")
-            await self._speak_console(text)
+            await self._speak_console(text, gen)
 
-    async def _speak_pyttsx3(self, text: str, pyttsx3_mod) -> None:  # noqa: ANN001
+    async def _speak_pyttsx3(self, text: str, pyttsx3_mod, gen: int) -> None:  # noqa: ANN001
         """Offload blocking pyttsx3 to a thread; chunk text so we can cancel."""
         engine = pyttsx3_mod.init()
 
@@ -92,7 +101,7 @@ class TTSEngine:
         sentences = _split_sentences(text)
         loop = asyncio.get_running_loop()
         for sentence in sentences:
-            if self._stop.is_set():
+            if self._cancelled(gen):
                 logger.info("TTS stopped (pyttsx3)")
                 break
             logger.info("[TTS pyttsx3] %s", sentence)
@@ -103,7 +112,7 @@ class TTSEngine:
             await asyncio.sleep(0.3)
         engine.stop()
 
-    async def _speak_console(self, text: str) -> None:
+    async def _speak_console(self, text: str, gen: int) -> None:
         """Print words to the log at speaking-pace (no audio)."""
         words = text.split()
         if not words:
@@ -111,7 +120,7 @@ class TTSEngine:
         wps = max(self._cfg.words_per_minute / 60.0, 1.0)
         step = 5
         for i in range(0, len(words), step):
-            if self._stop.is_set():
+            if self._cancelled(gen):
                 logger.info("TTS stopped (console)")
                 return
             chunk = " ".join(words[i : i + step])
@@ -120,61 +129,84 @@ class TTSEngine:
 
     # ── Azure backend ─────────────────────────────────────────────────────────
 
-    async def _speak_azure(self, text: str) -> None:
+    async def _speak_azure(self, text: str, gen: int) -> None:
         try:
             import azure.cognitiveservices.speech as speechsdk  # type: ignore[import-untyped]
         except ImportError:
             logger.warning("azure-cognitiveservices-speech not installed — falling back to local TTS")
-            await self._speak_local(text)
+            await self._speak_local(text, gen)
             return
 
         if not self._cfg.azure_speech_key:
             logger.warning("AZURE_SPEECH_KEY not set — falling back to local TTS")
-            await self._speak_local(text)
+            await self._speak_local(text, gen)
             return
 
         speech_config = speechsdk.SpeechConfig(
             subscription=self._cfg.azure_speech_key,
             region=self._cfg.azure_speech_region,
         )
-        # Don't set voice name here — we control it via SSML
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
-        self._azure_synthesizer = synthesizer  # allow stop_playback() to cancel
+        # Synthesise to memory so we can control playback & stop instantly
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
+        )
+        synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=speech_config, audio_config=None
+        )
+        self._azure_synthesizer = synthesizer
 
         voice = self._cfg.voice
         sentences = _split_sentences(text)
         loop = asyncio.get_running_loop()
         try:
             for sentence in sentences:
-                if self._stop.is_set():
+                if self._cancelled(gen):
                     logger.info("TTS stopped (Azure)")
                     break
                 logger.info("[TTS Azure] %s", sentence)
 
-                # Use SSML for conversational style + natural prosody
                 ssml = _build_ssml(sentence, voice)
                 try:
                     result = await loop.run_in_executor(
                         None, synthesizer.speak_ssml_async(ssml).get
                     )
                 except Exception:
-                    if self._stop.is_set():
+                    if self._cancelled(gen):
                         logger.info("TTS stopped mid-sentence (Azure)")
                         break
                     raise
-                if self._stop.is_set():
-                    logger.info("TTS stopped after sentence (Azure)")
+                if self._cancelled(gen):
+                    logger.info("TTS stopped after synthesis (Azure)")
                     break
                 if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
                     logger.error("Azure TTS failed: %s — %s", result.reason,
                                  result.cancellation_details.reason if result.cancellation_details else "")
+                    break
+
+                # Play the WAV audio — stoppable via winsound.PlaySound(None)
+                audio_data = result.audio_data
+                if not audio_data:
+                    continue
+                await loop.run_in_executor(None, _play_wav, audio_data)
+
+                # Wait for playback, checking cancel every 100ms
+                duration = _wav_duration(audio_data)
+                elapsed = 0.0
+                while elapsed < duration:
+                    if self._cancelled(gen):
+                        _stop_wav()
+                        logger.info("TTS audio stopped immediately")
+                        break
+                    await asyncio.sleep(0.1)
+                    elapsed += 0.1
+                if self._cancelled(gen):
                     break
         finally:
             self._azure_synthesizer = None
 
     # ── OpenAI backend ────────────────────────────────────────────────────────
 
-    async def _speak_openai(self, text: str) -> None:
+    async def _speak_openai(self, text: str, gen: int) -> None:
         try:
             if self._cfg.is_azure:
                 from openai import AzureOpenAI  # type: ignore[import-untyped]
@@ -182,12 +214,12 @@ class TTSEngine:
                 from openai import OpenAI  # type: ignore[import-untyped]
         except ImportError:
             logger.warning("openai package not installed \u2014 falling back to local TTS")
-            await self._speak_local(text)
+            await self._speak_local(text, gen)
             return
 
         if not self._cfg.openai_api_key:
             logger.warning("OPENAI_API_KEY not set \u2014 falling back to local TTS")
-            await self._speak_local(text)
+            await self._speak_local(text, gen)
             return
 
         if self._cfg.is_azure:
@@ -202,7 +234,7 @@ class TTSEngine:
 
         sentences = _split_sentences(text)
         for sentence in sentences:
-            if self._stop.is_set():
+            if self._cancelled(gen):
                 logger.info("TTS stopped (OpenAI)")
                 break
 
@@ -296,3 +328,41 @@ def _split_sentences(text: str) -> list[str]:
     import re
     raw = re.split(r"(?<=[.!?])\s+", text.strip())
     return [s for s in raw if s]
+
+
+# \u2500\u2500 Stoppable WAV playback (Windows winsound) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+def _play_wav(data: bytes) -> None:
+    """Start async WAV playback via winsound (returns immediately)."""
+    try:
+        import winsound
+        winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+    except Exception:
+        logger.debug("winsound playback failed", exc_info=True)
+
+
+def _stop_wav() -> None:
+    """Immediately silence any winsound playback."""
+    try:
+        import winsound
+        winsound.PlaySound(None, winsound.SND_PURGE)
+    except Exception:
+        pass
+
+
+def _wav_duration(data: bytes) -> float:
+    """Estimate WAV audio duration in seconds from raw RIFF data."""
+    import struct
+    if len(data) < 44:
+        return 0.0
+    try:
+        sample_rate = struct.unpack_from("<I", data, 24)[0]
+        bits_per_sample = struct.unpack_from("<H", data, 34)[0]
+        channels = struct.unpack_from("<H", data, 22)[0]
+        data_size = len(data) - 44
+        bps = (bits_per_sample // 8) * channels
+        if sample_rate == 0 or bps == 0:
+            return 0.0
+        return data_size / (sample_rate * bps)
+    except Exception:
+        return 0.0
