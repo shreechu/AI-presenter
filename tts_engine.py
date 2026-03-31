@@ -272,7 +272,11 @@ _STYLE_VOICES = frozenset({
 
 def _build_ssml(text: str, voice: str) -> str:
     """
-    Build SSML with friendly/conversational style + natural prosody.
+    Build SSML with conversational style + natural prosody.
+
+    Uses ``mstts:express-as`` for voices that support it, plus
+    ``prosody`` tweaks so the output sounds like a real presenter
+    rather than a bot reading text.
     """
     import xml.sax.saxutils as saxutils
     safe_text = saxutils.escape(text)
@@ -281,17 +285,18 @@ def _build_ssml(text: str, voice: str) -> str:
 
     inner = safe_text
     if use_style:
+        # "chat" sounds the most natural for presentation narration
         inner = (
-            f'<mstts:express-as style="friendly">'
+            f'<mstts:express-as style="chat" styledegree="1.2">'
             f'{safe_text}'
             f'</mstts:express-as>'
         )
 
     return (
         '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
-        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="en-US">'
+        'xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">'
         f'<voice name="{voice}">'
-        f'<prosody rate="-3%" pitch="+1%">'
+        f'<prosody rate="-5%" pitch="+2%">'
         f'{inner}'
         f'</prosody>'
         f'</voice>'
