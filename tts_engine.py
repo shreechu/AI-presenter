@@ -29,6 +29,7 @@ class TTSEngine:
         self._cfg = config
         self._stop = asyncio.Event()
         self._speaking = False
+        self._azure_synthesizer = None  # kept so stop_playback can cancel mid-utterance
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -39,6 +40,14 @@ class TTSEngine:
     def stop_playback(self) -> None:
         """Request the current utterance to stop as soon as possible."""
         self._stop.set()
+        # Cancel any in-flight Azure synthesis immediately
+        synth = self._azure_synthesizer
+        if synth is not None:
+            try:
+                synth.stop_speaking_async()
+                logger.info("Azure TTS synthesis cancelled")
+            except Exception:
+                logger.debug("Could not cancel Azure synthesizer", exc_info=True)
 
     async def speak(self, text: str) -> None:
         """Convert *text* to audio and play it.  Blocks until done or stopped."""
@@ -130,25 +139,38 @@ class TTSEngine:
         )
         # Don't set voice name here — we control it via SSML
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
+        self._azure_synthesizer = synthesizer  # allow stop_playback() to cancel
 
         voice = self._cfg.voice
         sentences = _split_sentences(text)
         loop = asyncio.get_running_loop()
-        for sentence in sentences:
-            if self._stop.is_set():
-                logger.info("TTS stopped (Azure)")
-                break
-            logger.info("[TTS Azure] %s", sentence)
+        try:
+            for sentence in sentences:
+                if self._stop.is_set():
+                    logger.info("TTS stopped (Azure)")
+                    break
+                logger.info("[TTS Azure] %s", sentence)
 
-            # Use SSML for conversational style + natural prosody
-            ssml = _build_ssml(sentence, voice)
-            result = await loop.run_in_executor(
-                None, synthesizer.speak_ssml_async(ssml).get
-            )
-            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                logger.error("Azure TTS failed: %s — %s", result.reason,
-                             result.cancellation_details.reason if result.cancellation_details else "")
-                break
+                # Use SSML for conversational style + natural prosody
+                ssml = _build_ssml(sentence, voice)
+                try:
+                    result = await loop.run_in_executor(
+                        None, synthesizer.speak_ssml_async(ssml).get
+                    )
+                except Exception:
+                    if self._stop.is_set():
+                        logger.info("TTS stopped mid-sentence (Azure)")
+                        break
+                    raise
+                if self._stop.is_set():
+                    logger.info("TTS stopped after sentence (Azure)")
+                    break
+                if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    logger.error("Azure TTS failed: %s — %s", result.reason,
+                                 result.cancellation_details.reason if result.cancellation_details else "")
+                    break
+        finally:
+            self._azure_synthesizer = None
 
     # ── OpenAI backend ────────────────────────────────────────────────────────
 

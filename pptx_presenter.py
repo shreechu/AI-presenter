@@ -4,16 +4,24 @@ advances / jumps slides in sync with the presenter bot.
 
 Uses ``win32com`` (pywin32) on Windows.  On other platforms the module
 gracefully degrades to a no-op logger.
+
+All COM calls are dispatched to a single dedicated thread to avoid
+marshalling errors (COM objects are apartment-threaded).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Single-thread pool shared by all COM operations so every call runs
+# on the thread that called CoInitialize.
+_com_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ppt-com")
 
 
 class PowerPointPresenter:
@@ -33,7 +41,7 @@ class PowerPointPresenter:
         Returns ``True`` on success, ``False`` if COM is unavailable.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._open_sync, pptx_path)
+        return await loop.run_in_executor(_com_executor, self._open_sync, pptx_path)
 
     def _open_sync(self, pptx_path: str) -> bool:
         try:
@@ -76,7 +84,7 @@ class PowerPointPresenter:
     async def close(self) -> None:
         """End the slideshow (leave PowerPoint open)."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._close_sync)
+        await loop.run_in_executor(_com_executor, self._close_sync)
 
     def _close_sync(self) -> None:
         try:
@@ -99,7 +107,7 @@ class PowerPointPresenter:
             return
         ppt_num = slide_index + 1  # convert 0-based → 1-based
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._goto_sync, ppt_num)
+        await loop.run_in_executor(_com_executor, self._goto_sync, ppt_num)
 
     def _goto_sync(self, ppt_slide_number: int) -> None:
         try:
@@ -114,7 +122,7 @@ class PowerPointPresenter:
         if not self._slideshow:
             return
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._next_sync)
+        await loop.run_in_executor(_com_executor, self._next_sync)
 
     def _next_sync(self) -> None:
         try:
@@ -128,7 +136,7 @@ class PowerPointPresenter:
         if not self._slideshow:
             return
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._prev_sync)
+        await loop.run_in_executor(_com_executor, self._prev_sync)
 
     def _prev_sync(self) -> None:
         try:
