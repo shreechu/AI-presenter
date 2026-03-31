@@ -146,14 +146,9 @@ class TTSEngine:
             subscription=self._cfg.azure_speech_key,
             region=self._cfg.azure_speech_region,
         )
-        # Synthesise to memory so we can control playback & stop instantly
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
-        )
-        synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=speech_config, audio_config=None
-        )
-        self._azure_synthesizer = synthesizer
+        # Use default audio output (high-quality speaker playback)
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
+        self._azure_synthesizer = synthesizer  # stop_playback() calls stop_speaking_async()
 
         voice = self._cfg.voice
         sentences = _split_sentences(text)
@@ -176,30 +171,11 @@ class TTSEngine:
                         break
                     raise
                 if self._cancelled(gen):
-                    logger.info("TTS stopped after synthesis (Azure)")
+                    logger.info("TTS stopped after sentence (Azure)")
                     break
                 if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
                     logger.error("Azure TTS failed: %s — %s", result.reason,
                                  result.cancellation_details.reason if result.cancellation_details else "")
-                    break
-
-                # Play the WAV audio — stoppable via winsound.PlaySound(None)
-                audio_data = result.audio_data
-                if not audio_data:
-                    continue
-                await loop.run_in_executor(None, _play_wav, audio_data)
-
-                # Wait for playback, checking cancel every 100ms
-                duration = _wav_duration(audio_data)
-                elapsed = 0.0
-                while elapsed < duration:
-                    if self._cancelled(gen):
-                        _stop_wav()
-                        logger.info("TTS audio stopped immediately")
-                        break
-                    await asyncio.sleep(0.1)
-                    elapsed += 0.1
-                if self._cancelled(gen):
                     break
         finally:
             self._azure_synthesizer = None
