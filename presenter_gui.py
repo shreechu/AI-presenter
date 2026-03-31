@@ -35,6 +35,7 @@ class PresenterApp:
         self._orchestrator: PresenterOrchestrator | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._paused = False
 
         self._build_ui()
         self._set_state("idle")
@@ -62,7 +63,13 @@ class PresenterApp:
             frame, text="Start Presenting", width=18,
             bg="#0078D4", fg="white", command=self._start,
         )
-        self._btn_start.grid(row=1, column=1, sticky="e", **pad)
+        self._btn_start.grid(row=1, column=0, sticky="e", **pad)
+
+        self._btn_pause = tk.Button(
+            frame, text="Pause", width=18,
+            bg="#E68A00", fg="white", command=self._toggle_pause,
+        )
+        self._btn_pause.grid(row=1, column=1, **pad)
 
         self._btn_stop = tk.Button(
             frame, text="Stop Presenting", width=18,
@@ -122,6 +129,30 @@ class PresenterApp:
             self._loop = None
             self._root.after(0, lambda: self._set_state("idle"))
 
+    def _toggle_pause(self) -> None:
+        if self._orchestrator is None:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        if self._paused:
+            asyncio.run_coroutine_threadsafe(
+                self._orchestrator.slide_ctrl.resume(), loop
+            )
+            self._paused = False
+            self._btn_pause.config(text="Pause", bg="#E68A00")
+            self._status_var.set("Presenting...")
+        else:
+            asyncio.run_coroutine_threadsafe(
+                self._orchestrator.slide_ctrl.pause(), loop
+            )
+            self._orchestrator.tts.stop_playback()
+            self._paused = False  # reset so next speak() works
+            self._paused = True
+            self._btn_pause.config(text="Resume", bg="#2D7D2D")
+            self._status_var.set("Paused")
+
     def _stop(self) -> None:
         if self._orchestrator is not None:
             self._orchestrator._shutdown.set()
@@ -138,15 +169,22 @@ class PresenterApp:
     def _set_state(self, state: str) -> None:
         if state == "running":
             self._btn_start.config(state="disabled")
+            self._btn_pause.config(state="normal")
             self._btn_stop.config(state="normal")
+            self._paused = False
+            self._btn_pause.config(text="Pause", bg="#E68A00")
             self._status_var.set("Presenting...")
         elif state == "stopping":
             self._btn_start.config(state="disabled")
+            self._btn_pause.config(state="disabled")
             self._btn_stop.config(state="disabled")
             self._status_var.set("Stopping...")
         else:
             self._btn_start.config(state="normal")
+            self._btn_pause.config(state="disabled")
             self._btn_stop.config(state="disabled")
+            self._paused = False
+            self._btn_pause.config(text="Pause", bg="#E68A00")
             self._status_var.set("Ready")
 
     def run(self) -> None:
