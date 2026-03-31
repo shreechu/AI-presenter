@@ -53,15 +53,21 @@ class TTSConfig:
     """Text-to-speech backend configuration."""
 
     backend: str = field(default_factory=lambda: _env("TTS_BACKEND", "local"))  # local | azure | openai
-    voice: str = field(default_factory=lambda: _env("TTS_VOICE", "en-US-AriaNeural"))
+    voice: str = field(default_factory=lambda: _env("TTS_VOICE", "en-US-AvaMultilingualNeural"))
     words_per_minute: int = field(default_factory=lambda: _env_int("TTS_WPM", 160))
     # Azure Speech
     azure_speech_key: str = field(default_factory=lambda: _env("AZURE_SPEECH_KEY"), repr=False)
     azure_speech_region: str = field(default_factory=lambda: _env("AZURE_SPEECH_REGION", "eastus"))
     # OpenAI TTS
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY"), repr=False)
+    azure_endpoint: str = field(default_factory=lambda: _env("AZURE_OPENAI_ENDPOINT"))
+    azure_api_version: str = field(default_factory=lambda: _env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"))
     openai_tts_model: str = field(default_factory=lambda: _env("OPENAI_TTS_MODEL", "tts-1"))
     openai_tts_voice: str = field(default_factory=lambda: _env("OPENAI_TTS_VOICE", "alloy"))
+
+    @property
+    def is_azure(self) -> bool:
+        return bool(self.azure_endpoint)
 
 
 # ── Audio / Whisper ───────────────────────────────────────────────────────────
@@ -132,8 +138,14 @@ class LLMConfig:
     """Settings for AI-generated answers to audience questions."""
 
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY"), repr=False)
+    azure_endpoint: str = field(default_factory=lambda: _env("AZURE_OPENAI_ENDPOINT"))
+    azure_api_version: str = field(default_factory=lambda: _env("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"))
     model: str = field(default_factory=lambda: _env("OPENAI_CHAT_MODEL", "gpt-4o"))
     max_answer_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_ANSWER_TOKENS", 200))
+
+    @property
+    def is_azure(self) -> bool:
+        return bool(self.azure_endpoint)
 
 
 # ── Top-level composite config ────────────────────────────────────────────────

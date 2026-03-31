@@ -11,6 +11,8 @@ build/
 *.mp3
 *.wav
 *.tmp
+*.pptx
+test_voice.py
 .env
 .env.*
 *.log

@@ -68,17 +68,30 @@ class TTSEngine:
     async def _speak_pyttsx3(self, text: str, pyttsx3_mod) -> None:  # noqa: ANN001
         """Offload blocking pyttsx3 to a thread; chunk text so we can cancel."""
         engine = pyttsx3_mod.init()
-        engine.setProperty("rate", self._cfg.words_per_minute)
+
+        # Tune for more natural output
+        engine.setProperty("rate", 150)   # slightly slower than default 200
+        engine.setProperty("volume", 0.95)
+
+        # Prefer female voice (Zira) — sounds slightly more natural on Windows
+        voices = engine.getProperty("voices")
+        for v in voices:
+            if "zira" in v.name.lower():
+                engine.setProperty("voice", v.id)
+                break
 
         sentences = _split_sentences(text)
+        loop = asyncio.get_running_loop()
         for sentence in sentences:
             if self._stop.is_set():
                 logger.info("TTS stopped (pyttsx3)")
                 break
             logger.info("[TTS pyttsx3] %s", sentence)
-            await asyncio.get_running_loop().run_in_executor(
+            await loop.run_in_executor(
                 None, lambda s=sentence: (engine.say(s), engine.runAndWait()),  # type: ignore[misc]
             )
+            # Small pause between sentences for natural pacing
+            await asyncio.sleep(0.3)
         engine.stop()
 
     async def _speak_console(self, text: str) -> None:
@@ -115,10 +128,10 @@ class TTSEngine:
             subscription=self._cfg.azure_speech_key,
             region=self._cfg.azure_speech_region,
         )
-        speech_config.speech_synthesis_voice_name = self._cfg.voice
-
+        # Don't set voice name here — we control it via SSML
         synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config)
 
+        voice = self._cfg.voice
         sentences = _split_sentences(text)
         loop = asyncio.get_running_loop()
         for sentence in sentences:
@@ -126,27 +139,43 @@ class TTSEngine:
                 logger.info("TTS stopped (Azure)")
                 break
             logger.info("[TTS Azure] %s", sentence)
-            result = await loop.run_in_executor(None, synthesizer.speak_text_async(sentence).get)
+
+            # Use SSML for conversational style + natural prosody
+            ssml = _build_ssml(sentence, voice)
+            result = await loop.run_in_executor(
+                None, synthesizer.speak_ssml_async(ssml).get
+            )
             if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                logger.error("Azure TTS failed: %s", result.reason)
+                logger.error("Azure TTS failed: %s — %s", result.reason,
+                             result.cancellation_details.reason if result.cancellation_details else "")
                 break
 
     # ── OpenAI backend ────────────────────────────────────────────────────────
 
     async def _speak_openai(self, text: str) -> None:
         try:
-            from openai import OpenAI  # type: ignore[import-untyped]
+            if self._cfg.is_azure:
+                from openai import AzureOpenAI  # type: ignore[import-untyped]
+            else:
+                from openai import OpenAI  # type: ignore[import-untyped]
         except ImportError:
-            logger.warning("openai package not installed — falling back to local TTS")
+            logger.warning("openai package not installed \u2014 falling back to local TTS")
             await self._speak_local(text)
             return
 
         if not self._cfg.openai_api_key:
-            logger.warning("OPENAI_API_KEY not set — falling back to local TTS")
+            logger.warning("OPENAI_API_KEY not set \u2014 falling back to local TTS")
             await self._speak_local(text)
             return
 
-        client = OpenAI(api_key=self._cfg.openai_api_key)
+        if self._cfg.is_azure:
+            client = AzureOpenAI(
+                api_key=self._cfg.openai_api_key,
+                azure_endpoint=self._cfg.azure_endpoint,
+                api_version=self._cfg.azure_api_version,
+            )
+        else:
+            client = OpenAI(api_key=self._cfg.openai_api_key)
         loop = asyncio.get_running_loop()
 
         sentences = _split_sentences(text)
@@ -194,6 +223,51 @@ class TTSEngine:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Voices that support the "friendly" express-as style
+_STYLE_VOICES = frozenset({
+    "en-US-AriaNeural",
+    "en-US-JennyNeural",
+    "en-US-SaraNeural",
+    "en-US-DavisNeural",
+    "en-US-JaneNeural",
+    "en-US-NancyNeural",
+    "en-US-TonyNeural",
+    "en-US-AvaMultilingualNeural",
+    "en-US-AndrewMultilingualNeural",
+    "en-US-EmmaMultilingualNeural",
+    "en-US-BrianMultilingualNeural",
+})
+
+
+def _build_ssml(text: str, voice: str) -> str:
+    """
+    Build SSML with friendly/conversational style + natural prosody.
+    """
+    import xml.sax.saxutils as saxutils
+    safe_text = saxutils.escape(text)
+
+    use_style = voice in _STYLE_VOICES
+
+    inner = safe_text
+    if use_style:
+        inner = (
+            f'<mstts:express-as style="friendly">'
+            f'{safe_text}'
+            f'</mstts:express-as>'
+        )
+
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="en-US">'
+        f'<voice name="{voice}">'
+        f'<prosody rate="-3%" pitch="+1%">'
+        f'{inner}'
+        f'</prosody>'
+        f'</voice>'
+        f'</speak>'
+    )
+
 
 def _split_sentences(text: str) -> list[str]:
     """Split text on sentence boundaries for chunked TTS with cancellation points."""

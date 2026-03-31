@@ -167,11 +167,12 @@ def load_slides_from_pptx(path: str | Path) -> List[Slide]:
         if not title:
             title = f"Slide {idx + 1}"
 
-        # Speaker notes
+        # Speaker notes — extract only the "Speaker script:" section
         notes = ""
         if pptx_slide.has_notes_slide:
             notes_frame = pptx_slide.notes_slide.notes_text_frame
-            notes = notes_frame.text.strip() if notes_frame else ""
+            raw_notes = notes_frame.text.strip() if notes_frame else ""
+            notes = _extract_speaker_script(raw_notes)
 
         slides.append(Slide(index=idx, title=title, speaker_notes=notes))
         logger.info("Loaded slide %d: %s (%d chars of notes)", idx, title, len(notes))
@@ -260,6 +261,52 @@ _STOP_WORDS = frozenset(
 
 def _tokenize(text: str) -> List[str]:
     return [m.group(0).lower() for m in _WORD_RE.finditer(text or "") if m.group(0).lower() not in _STOP_WORDS]
+
+
+# Known section headers in speaker notes that are NOT the script
+_NON_SCRIPT_HEADERS = re.compile(
+    r"^(source\s*link|hints|references?|links?|notes?|resources?)\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_speaker_script(raw_notes: str) -> str:
+    """
+    Extract only the text under 'Speaker script:' from the notes pane.
+
+    If notes contain a 'Speaker script:' header, return everything from that
+    header until the next known section header (Source link, Hints, etc.) or
+    end of text.  If there is no 'Speaker script:' header, return empty string
+    (the slide has no script to read aloud).
+    """
+    lines = raw_notes.splitlines()
+    collecting = False
+    script_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Start collecting after "Speaker script:"
+        if stripped.lower().startswith("speaker script"):
+            collecting = True
+            # If there's text on the same line after the colon, keep it
+            after_colon = stripped.split(":", 1)
+            if len(after_colon) > 1 and after_colon[1].strip():
+                script_lines.append(after_colon[1].strip())
+            continue
+
+        # Stop collecting if we hit another section header
+        if collecting and _NON_SCRIPT_HEADERS.match(stripped):
+            break
+
+        # Stop if we hit a URL line (part of Source link section)
+        if collecting and stripped.startswith("http") and not script_lines:
+            continue
+
+        if collecting and stripped:
+            script_lines.append(stripped)
+
+    return " ".join(script_lines).strip()
 
 
 def _compute_idf(documents: List[str]) -> dict[str, float]:

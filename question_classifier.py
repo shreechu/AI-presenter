@@ -139,12 +139,26 @@ class LLMQuestionClassifier:
         "Do NOT add any other text."
     )
 
-    def __init__(self, api_key: str, model: str = "gpt-4o") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4o",
+        azure_endpoint: str = "",
+        azure_api_version: str = "2024-12-01-preview",
+    ) -> None:
         try:
-            from openai import OpenAI  # type: ignore[import-untyped]
+            if azure_endpoint:
+                from openai import AzureOpenAI  # type: ignore[import-untyped]
+                self._client = AzureOpenAI(
+                    api_key=api_key,
+                    azure_endpoint=azure_endpoint,
+                    api_version=azure_api_version,
+                )
+            else:
+                from openai import OpenAI  # type: ignore[import-untyped]
+                self._client = OpenAI(api_key=api_key)
         except ImportError:
             raise ImportError("openai package is required for LLM classifier")
-        self._client = OpenAI(api_key=api_key)
         self._model = model
 
     async def classify(self, text: str) -> ClassificationResult:

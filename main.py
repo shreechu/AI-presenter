@@ -20,6 +20,7 @@ from typing import List, Optional
 
 from audio_listener import AudioListener, AudioTranscript
 from config import AppConfig
+from pptx_presenter import PowerPointPresenter
 from question_classifier import (
     ClassificationResult,
     Intent,
@@ -61,6 +62,7 @@ class PresenterOrchestrator:
         self.tts = TTSEngine(config.tts)
         self.audio = AudioListener(config.audio)
         self.teams = TeamsPresenterBot(config.teams, self.audio)
+        self.ppt = PowerPointPresenter()
         self.context = PresentationContext()
 
         # Classifiers
@@ -70,8 +72,10 @@ class PresenterOrchestrator:
                 llm_cls = LLMQuestionClassifier(
                     api_key=config.llm.openai_api_key,
                     model=config.llm.model,
+                    azure_endpoint=config.llm.azure_endpoint,
+                    azure_api_version=config.llm.azure_api_version,
                 )
-                logger.info("LLM classifier enabled (model=%s)", config.llm.model)
+                logger.info("LLM classifier enabled (model=%s, azure=%s)", config.llm.model, config.llm.is_azure)
             except ImportError:
                 logger.warning("openai package not installed — LLM classifier disabled")
 
@@ -90,6 +94,14 @@ class PresenterOrchestrator:
 
         await self.teams.join_meeting("demo-meeting-id")
         self.teams.on_chat_message(self._on_chat_message)
+
+        # Launch PowerPoint slideshow if we loaded a real PPTX
+        if self.config.slide.pptx_path:
+            ok = await self.ppt.open_and_start(self.config.slide.pptx_path)
+            if ok:
+                _status("[PPT] Slideshow launched")
+            else:
+                _status("[PPT] Could not launch slideshow — continuing without it")
 
         tasks: list[asyncio.Task] = [
             asyncio.create_task(self._consume_audio_events(), name="audio-consumer"),
@@ -123,6 +135,7 @@ class PresenterOrchestrator:
                 t.cancel()
                 with suppress(asyncio.CancelledError):
                     await t
+            await self.ppt.close()
             await self.teams.leave_meeting()
             self._print_summary()
 
@@ -141,6 +154,9 @@ class PresenterOrchestrator:
             self.context.slides_presented.append(slide.index)
 
             _status(f"[Slide {idx + 1}/{total}] {slide.title}")
+
+            # Sync live PowerPoint slideshow
+            await self.ppt.goto_slide(slide.index)
 
             # Notify Teams chat about current slide
             await self.teams.post_slide_highlight(slide.index, slide.title)
@@ -234,12 +250,14 @@ class PresenterOrchestrator:
         if cmd == "next":
             s = await self.slide_ctrl.advance()
             if s:
+                await self.ppt.goto_slide(s.index)
                 _status(f"[>> Skipped to slide {s.index + 1}] {s.title}")
             else:
                 _status("Already on the last slide")
         elif cmd == "back":
             s = await self.slide_ctrl.go_back()
             if s:
+                await self.ppt.goto_slide(s.index)
                 _status(f"[<< Back to slide {s.index + 1}] {s.title}")
             else:
                 _status("Already on the first slide")
@@ -263,6 +281,7 @@ class PresenterOrchestrator:
         # Jump to the relevant slide if different
         if relevant and relevant.index != current.index:
             await self.slide_ctrl.jump_to(relevant.index)
+            await self.ppt.goto_slide(relevant.index)
             _status(f"[-> Jumped to slide {relevant.index + 1}] {relevant.title}")
 
         target = relevant or current
@@ -281,9 +300,7 @@ class PresenterOrchestrator:
         return f"Based on slide {target.index + 1} ({target.title}): {snippet}."
 
     async def _llm_answer(self, question: str, slide: Slide) -> str:
-        from openai import OpenAI  # type: ignore[import-untyped]
-
-        client = OpenAI(api_key=self.config.llm.openai_api_key)
+        client = _get_openai_client(self.config.llm)
         loop = asyncio.get_running_loop()
 
         system = (
@@ -356,6 +373,20 @@ def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
         except NotImplementedError:
             # Windows doesn't support add_signal_handler for SIGTERM
             pass
+
+
+def _get_openai_client(llm_cfg):
+    """Return an AzureOpenAI or OpenAI client depending on config."""
+    if llm_cfg.is_azure:
+        from openai import AzureOpenAI  # type: ignore[import-untyped]
+        return AzureOpenAI(
+            api_key=llm_cfg.openai_api_key,
+            azure_endpoint=llm_cfg.azure_endpoint,
+            api_version=llm_cfg.azure_api_version,
+        )
+    else:
+        from openai import OpenAI  # type: ignore[import-untyped]
+        return OpenAI(api_key=llm_cfg.openai_api_key)
 
 
 def _configure_logging(level: str) -> None:
