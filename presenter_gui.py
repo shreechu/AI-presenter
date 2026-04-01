@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from config import AppConfig
+from audio_listener import AudioTranscript
 from main import PresenterOrchestrator, _configure_logging
 
 logger = logging.getLogger(__name__)
@@ -77,10 +78,23 @@ class PresenterApp:
         )
         self._btn_stop.grid(row=1, column=2, sticky="w", **pad)
 
-        # Row 2 — status
+        # Row 2 — ask question
+        tk.Label(frame, text="Ask a question:", anchor="w").grid(
+            row=2, column=0, sticky="w", **pad
+        )
+        self._question_var = tk.StringVar()
+        self._question_entry = tk.Entry(frame, textvariable=self._question_var, width=52)
+        self._question_entry.grid(row=2, column=1, **pad)
+        self._question_entry.bind("<Return>", lambda e: self._ask_question())
+        self._btn_ask = tk.Button(
+            frame, text="Ask", width=10, command=self._ask_question,
+        )
+        self._btn_ask.grid(row=2, column=2, **pad)
+
+        # Row 3 — status
         self._status_var = tk.StringVar(value="Ready")
         tk.Label(frame, textvariable=self._status_var, anchor="w", fg="gray").grid(
-            row=2, column=0, columnspan=3, sticky="w", **pad
+            row=3, column=0, columnspan=3, sticky="w", **pad
         )
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -153,6 +167,21 @@ class PresenterApp:
             self._btn_pause.config(text="Resume", bg="#2D7D2D")
             self._status_var.set("Paused")
 
+    def _ask_question(self) -> None:
+        question = self._question_var.get().strip()
+        if not question:
+            return
+        if self._orchestrator is None or self._loop is None or self._loop.is_closed():
+            return
+        transcript = AudioTranscript(
+            source="gui", speaker="presenter", text=question
+        )
+        asyncio.run_coroutine_threadsafe(
+            self._orchestrator.audio.push_transcript(transcript), self._loop
+        )
+        self._question_var.set("")
+        self._status_var.set(f"Question sent: {question[:60]}")
+
     def _stop(self) -> None:
         if self._orchestrator is not None:
             self._orchestrator._shutdown.set()
@@ -171,6 +200,8 @@ class PresenterApp:
             self._btn_start.config(state="disabled")
             self._btn_pause.config(state="normal")
             self._btn_stop.config(state="normal")
+            self._btn_ask.config(state="normal")
+            self._question_entry.config(state="normal")
             self._paused = False
             self._btn_pause.config(text="Pause", bg="#E68A00")
             self._status_var.set("Presenting...")
@@ -178,11 +209,15 @@ class PresenterApp:
             self._btn_start.config(state="disabled")
             self._btn_pause.config(state="disabled")
             self._btn_stop.config(state="disabled")
+            self._btn_ask.config(state="disabled")
+            self._question_entry.config(state="disabled")
             self._status_var.set("Stopping...")
         else:
             self._btn_start.config(state="normal")
             self._btn_pause.config(state="disabled")
             self._btn_stop.config(state="disabled")
+            self._btn_ask.config(state="disabled")
+            self._question_entry.config(state="disabled")
             self._paused = False
             self._btn_pause.config(text="Pause", bg="#E68A00")
             self._status_var.set("Ready")
