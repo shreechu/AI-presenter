@@ -85,6 +85,8 @@ class PresenterOrchestrator:
         )
 
         self._shutdown = asyncio.Event()
+        self._answering = asyncio.Event()  # set while Q&A is in progress
+        self._answering.set()  # starts in "not answering" state (set = clear to proceed)
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -169,7 +171,10 @@ class PresenterOrchestrator:
                 except Exception:
                     logger.exception("TTS playback failed on slide %d", slide.index)
 
-            # If paused mid-TTS, wait for resume
+            # Wait for any in-progress Q&A to finish before advancing
+            await self._answering.wait()
+
+            # If paused (by interrupt or command), wait for resume
             while await self.slide_ctrl.is_paused() and not self._shutdown.is_set():
                 await asyncio.sleep(0.2)
             if self._shutdown.is_set():
@@ -219,29 +224,32 @@ class PresenterOrchestrator:
             return
 
         # ── Question or unknown interruption → pause ─────────────────────────
+        self._answering.clear()  # signal presentation loop to wait
         await self.slide_ctrl.pause()
         self.tts.stop_playback()
         _status("[PAUSED] for interruption")
 
-        if event.classification.is_question and self.config.detection.answer_questions_immediately:
-            _status("[Generating answer...]")
-            answer = await self._answer_question(event.text)
-            self.context.conversation_history.append(f"Q: {event.text}")
-            self.context.conversation_history.append(f"A: {answer}")
-            self.context.questions_answered += 1
+        try:
+            if event.classification.is_question and self.config.detection.answer_questions_immediately:
+                _status("[Generating answer...]")
+                answer = await self._answer_question(event.text)
+                self.context.conversation_history.append(f"Q: {event.text}")
+                self.context.conversation_history.append(f"A: {answer}")
+                self.context.questions_answered += 1
 
-            await self.teams.post_chat_message(f"A: {answer}")
+                await self.teams.post_chat_message(f"A: {answer}")
 
-            _status(f"[Answer] {answer}")
-            try:
-                await self.tts.speak(answer)
-            except Exception:
-                logger.exception("TTS failed while answering")
-        else:
-            logger.info("Non-question interruption — resuming shortly")
-
-        await self.slide_ctrl.resume()
-        _status("[RESUMED]")
+                _status(f"[Answer] {answer}")
+                try:
+                    await self.tts.speak(answer)
+                except Exception:
+                    logger.exception("TTS failed while answering")
+            else:
+                logger.info("Non-question interruption — resuming shortly")
+        finally:
+            await self.slide_ctrl.resume()
+            self._answering.set()  # allow presentation loop to continue
+            _status("[RESUMED]")
 
     # ── Command execution ─────────────────────────────────────────────────────
 
