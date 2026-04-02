@@ -98,7 +98,8 @@ class PresenterOrchestrator:
         self.teams.on_chat_message(self._on_chat_message)
 
         # Launch PowerPoint slideshow if we loaded a real PPTX
-        if self.config.slide.pptx_path:
+        # (skipped when the GUI has already loaded the slideshow via Load button)
+        if self.config.slide.pptx_path and not self.ppt.is_active:
             ok = await self.ppt.open_and_start(self.config.slide.pptx_path)
             if ok:
                 _status("[PPT] Slideshow launched")
@@ -123,8 +124,17 @@ class PresenterOrchestrator:
                 name="sim-teams",
             ))
 
-        # Real microphone
-        if self.config.audio.use_real_mic:
+        # Azure Speech recognition (preferred over Whisper)
+        if self.config.tts.azure_speech_key:
+            tasks.append(asyncio.create_task(
+                self.audio.start_azure_speech_recognition(
+                    speech_key=self.config.tts.azure_speech_key,
+                    speech_region=self.config.tts.azure_speech_region,
+                ),
+                name="azure-stt",
+            ))
+        elif self.config.audio.use_real_mic:
+            # Fallback to Whisper-based mic capture
             tasks.append(asyncio.create_task(
                 self.audio.start_microphone_capture(),
                 name="mic-capture",

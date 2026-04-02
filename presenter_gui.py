@@ -1,10 +1,10 @@
 """
-Minimal Windows GUI for the AI Presenter Bot.
+Windows GUI for the AI Presenter Bot.
 
-Three controls:
-  1. File picker — choose a .pptx file
-  2. Start Presenting button
-  3. Stop Presenting button
+Controls:
+  1. File picker + Load button (opens PPT in slideshow mode)
+  2. Start Presenting / Pause / Stop buttons
+  3. Status bar
 
 Runs the async orchestrator on a background thread so the UI stays responsive.
 """
@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from config import AppConfig
-from audio_listener import AudioTranscript
+from pptx_presenter import PowerPointPresenter
 from main import PresenterOrchestrator, _configure_logging
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ class PresenterApp:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._paused = False
+        self._ppt = PowerPointPresenter()  # shared instance for Load button
 
         self._build_ui()
         self._set_state("idle")
@@ -48,18 +49,24 @@ class PresenterApp:
         frame = tk.Frame(self._root, padx=16, pady=16)
         frame.pack()
 
-        # Row 0 — file picker
+        # Row 0 — file picker + Load
         tk.Label(frame, text="Presentation file:", anchor="w").grid(
             row=0, column=0, sticky="w", **pad
         )
         self._file_var = tk.StringVar()
-        entry = tk.Entry(frame, textvariable=self._file_var, width=52, state="readonly")
+        entry = tk.Entry(frame, textvariable=self._file_var, width=48, state="readonly")
         entry.grid(row=0, column=1, **pad)
-        tk.Button(frame, text="Browse...", command=self._browse).grid(
-            row=0, column=2, **pad
-        )
 
-        # Row 1 — buttons
+        btn_frame = tk.Frame(frame)
+        btn_frame.grid(row=0, column=2, **pad)
+        tk.Button(btn_frame, text="Browse...", command=self._browse).pack(side="left", padx=(0, 4))
+        self._btn_load = tk.Button(
+            btn_frame, text="Load", width=8,
+            bg="#5B5FC7", fg="white", command=self._load,
+        )
+        self._btn_load.pack(side="left")
+
+        # Row 1 — Start / Pause / Stop
         self._btn_start = tk.Button(
             frame, text="Start Presenting", width=18,
             bg="#0078D4", fg="white", command=self._start,
@@ -78,23 +85,10 @@ class PresenterApp:
         )
         self._btn_stop.grid(row=1, column=2, sticky="w", **pad)
 
-        # Row 2 — ask question
-        tk.Label(frame, text="Ask a question:", anchor="w").grid(
-            row=2, column=0, sticky="w", **pad
-        )
-        self._question_var = tk.StringVar()
-        self._question_entry = tk.Entry(frame, textvariable=self._question_var, width=52)
-        self._question_entry.grid(row=2, column=1, **pad)
-        self._question_entry.bind("<Return>", lambda e: self._ask_question())
-        self._btn_ask = tk.Button(
-            frame, text="Ask", width=10, command=self._ask_question,
-        )
-        self._btn_ask.grid(row=2, column=2, **pad)
-
-        # Row 3 — status
+        # Row 2 — status
         self._status_var = tk.StringVar(value="Ready")
         tk.Label(frame, textvariable=self._status_var, anchor="w", fg="gray").grid(
-            row=3, column=0, columnspan=3, sticky="w", **pad
+            row=2, column=0, columnspan=3, sticky="w", **pad
         )
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -108,6 +102,35 @@ class PresenterApp:
         )
         if path:
             self._file_var.set(path)
+            self._set_state("idle")  # reset if re-browsing
+
+    def _load(self) -> None:
+        """Open the selected PPTX in PowerPoint slideshow mode."""
+        pptx = self._file_var.get().strip()
+        if not pptx:
+            messagebox.showwarning("No file selected", "Please choose a .pptx file first.")
+            return
+        self._status_var.set("Loading slideshow...")
+        self._btn_load.config(state="disabled")
+        # Run COM call on a thread to keep UI responsive
+        threading.Thread(target=self._load_sync, args=(pptx,), daemon=True).start()
+
+    def _load_sync(self, pptx: str) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            ok = loop.run_until_complete(self._ppt.open_and_start(pptx))
+        except Exception:
+            ok = False
+            logger.exception("Failed to load slideshow")
+        finally:
+            loop.close()
+        if ok:
+            self._root.after(0, lambda: self._set_state("loaded"))
+        else:
+            self._root.after(0, lambda: self._set_state("idle"))
+            self._root.after(0, lambda: messagebox.showerror(
+                "Load failed", "Could not open PowerPoint in slideshow mode."
+            ))
 
     def _start(self) -> None:
         pptx = self._file_var.get().strip()
@@ -125,6 +148,8 @@ class PresenterApp:
         _configure_logging(config.log_level)
 
         self._orchestrator = PresenterOrchestrator(config)
+        # Share the already-loaded PPT instance so run() doesn't re-open it
+        self._orchestrator.ppt = self._ppt
 
         # Run the async orchestrator on a dedicated thread with its own event loop
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -141,7 +166,9 @@ class PresenterApp:
         finally:
             self._loop.close()
             self._loop = None
-            self._root.after(0, lambda: self._set_state("idle"))
+            self._root.after(0, lambda: self._set_state(
+                "loaded" if self._ppt.is_active else "idle"
+            ))
 
     def _toggle_pause(self) -> None:
         if self._orchestrator is None:
@@ -162,25 +189,9 @@ class PresenterApp:
                 self._orchestrator.slide_ctrl.pause(), loop
             )
             self._orchestrator.tts.stop_playback()
-            self._paused = False  # reset so next speak() works
             self._paused = True
             self._btn_pause.config(text="Resume", bg="#2D7D2D")
             self._status_var.set("Paused")
-
-    def _ask_question(self) -> None:
-        question = self._question_var.get().strip()
-        if not question:
-            return
-        if self._orchestrator is None or self._loop is None or self._loop.is_closed():
-            return
-        transcript = AudioTranscript(
-            source="gui", speaker="presenter", text=question
-        )
-        asyncio.run_coroutine_threadsafe(
-            self._orchestrator.audio.push_transcript(transcript), self._loop
-        )
-        self._question_var.set("")
-        self._status_var.set(f"Question sent: {question[:60]}")
 
     def _stop(self) -> None:
         if self._orchestrator is not None:
@@ -191,33 +202,46 @@ class PresenterApp:
 
     def _on_close(self) -> None:
         self._stop()
+        # Close slideshow if still active
+        if self._ppt.is_active:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(self._ppt.close())
+            finally:
+                loop.close()
         self._root.after(500, self._root.destroy)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _set_state(self, state: str) -> None:
-        if state == "running":
-            self._btn_start.config(state="disabled")
-            self._btn_pause.config(state="normal")
-            self._btn_stop.config(state="normal")
-            self._btn_ask.config(state="normal")
-            self._question_entry.config(state="normal")
-            self._paused = False
-            self._btn_pause.config(text="Pause", bg="#E68A00")
-            self._status_var.set("Presenting...")
-        elif state == "stopping":
-            self._btn_start.config(state="disabled")
-            self._btn_pause.config(state="disabled")
-            self._btn_stop.config(state="disabled")
-            self._btn_ask.config(state="disabled")
-            self._question_entry.config(state="disabled")
-            self._status_var.set("Stopping...")
-        else:
+        if state == "loaded":
+            # PPT is in slideshow mode, ready to start narration
+            self._btn_load.config(state="disabled")
             self._btn_start.config(state="normal")
             self._btn_pause.config(state="disabled")
             self._btn_stop.config(state="disabled")
-            self._btn_ask.config(state="disabled")
-            self._question_entry.config(state="disabled")
+            self._paused = False
+            self._btn_pause.config(text="Pause", bg="#E68A00")
+            self._status_var.set("Slideshow loaded — click Start Presenting")
+        elif state == "running":
+            self._btn_load.config(state="disabled")
+            self._btn_start.config(state="disabled")
+            self._btn_pause.config(state="normal")
+            self._btn_stop.config(state="normal")
+            self._paused = False
+            self._btn_pause.config(text="Pause", bg="#E68A00")
+            self._status_var.set("Presenting... (listening on microphone)")
+        elif state == "stopping":
+            self._btn_load.config(state="disabled")
+            self._btn_start.config(state="disabled")
+            self._btn_pause.config(state="disabled")
+            self._btn_stop.config(state="disabled")
+            self._status_var.set("Stopping...")
+        else:  # idle
+            self._btn_load.config(state="normal")
+            self._btn_start.config(state="disabled")
+            self._btn_pause.config(state="disabled")
+            self._btn_stop.config(state="disabled")
             self._paused = False
             self._btn_pause.config(text="Pause", bg="#E68A00")
             self._status_var.set("Ready")

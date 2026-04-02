@@ -4,6 +4,7 @@ transcript events to the rest of the system.
 
 Supports:
   * **Simulated** input (scripted audience lines for testing).
+  * **Azure Speech** continuous recognition (preferred — uses Azure Speech SDK).
   * **Real microphone** capture via ``sounddevice`` + **Whisper** transcription.
 """
 
@@ -140,3 +141,68 @@ class AudioListener:
         model = await loop.run_in_executor(None, whisper.load_model, self._cfg.whisper_model)
         logger.info("Whisper model loaded")
         return model
+
+    # ── Azure Speech continuous recognition ───────────────────────────────────
+
+    async def start_azure_speech_recognition(
+        self, speech_key: str, speech_region: str
+    ) -> None:
+        """
+        Use Azure Speech SDK for continuous speech-to-text from the default
+        microphone.  Recognised text is pushed as transcript events.
+        """
+        try:
+            import azure.cognitiveservices.speech as speechsdk
+        except ImportError:
+            logger.error(
+                "azure-cognitiveservices-speech is required. "
+                "Install with: pip install azure-cognitiveservices-speech"
+            )
+            return
+
+        speech_config = speechsdk.SpeechConfig(
+            subscription=speech_key, region=speech_region
+        )
+        speech_config.speech_recognition_language = "en-US"
+        audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config, audio_config=audio_config
+        )
+
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+
+        def on_recognized(evt):
+            text = evt.result.text.strip() if evt.result.text else ""
+            if text:
+                logger.info("[Azure STT] %s", text)
+                transcript = AudioTranscript(
+                    source="microphone", speaker="audience", text=text
+                )
+                asyncio.run_coroutine_threadsafe(
+                    self.push_transcript(transcript), loop
+                )
+
+        def on_canceled(evt):
+            logger.warning("Azure STT cancelled: %s", evt.reason)
+            loop.call_soon_threadsafe(done.set)
+
+        def on_stopped(evt):
+            logger.info("Azure STT session stopped")
+            loop.call_soon_threadsafe(done.set)
+
+        recognizer.recognized.connect(on_recognized)
+        recognizer.canceled.connect(on_canceled)
+        recognizer.session_stopped.connect(on_stopped)
+
+        recognizer.start_continuous_recognition()
+        logger.info("Azure Speech recognition started (listening on microphone)")
+
+        try:
+            await done.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            recognizer.stop_continuous_recognition()
+            logger.info("Azure Speech recognition stopped")
