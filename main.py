@@ -89,6 +89,7 @@ class PresenterOrchestrator:
         self._answering.set()  # starts in "not answering" state (set = clear to proceed)
         self._tts_active = False  # True while TTS is playing
         self._current_notes_words: set[str] = set()  # words of the notes being spoken (echo detection)
+        self._interrupted = False  # set by _handle_transcript when it stops TTS
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -180,6 +181,7 @@ class PresenterOrchestrator:
                 _status("[Speaking notes...]")
                 self._current_notes_words = set(slide.speaker_notes.lower().split())
                 self._tts_active = True
+                self._interrupted = False
                 try:
                     await self.tts.speak(slide.speaker_notes)
                 except Exception:
@@ -187,6 +189,12 @@ class PresenterOrchestrator:
                 finally:
                     self._tts_active = False
                     self._current_notes_words = set()
+
+            # If TTS was interrupted by audience speech, yield so the
+            # audio-consumer task can clear _answering and pause us.
+            if self._interrupted:
+                self._interrupted = False
+                await asyncio.sleep(0.3)
 
             # Wait for any in-progress Q&A to finish before advancing
             await self._answering.wait()
@@ -232,6 +240,7 @@ class PresenterOrchestrator:
         # If we get here while TTS is active, it's a genuine interruption —
         # stop speaking immediately so the audience can be heard.
         if self._tts_active:
+            self._interrupted = True  # signal presentation loop to yield
             self.tts.stop_playback()
             self._tts_active = False
             logger.info("TTS interrupted by audience speech")
@@ -261,7 +270,10 @@ class PresenterOrchestrator:
         _status("[PAUSED] for interruption")
 
         try:
-            if event.classification.is_question and self.config.detection.answer_questions_immediately:
+            # Treat both explicit questions AND unknown interruptions as
+            # questions worth answering — a human presenter would respond
+            # to any audience speech, not just perfectly-formed questions.
+            if self.config.detection.answer_questions_immediately:
                 _status("[Generating answer...]")
                 answer = await self._answer_question(event.text)
                 self.context.conversation_history.append(f"Q: {event.text}")
@@ -281,7 +293,7 @@ class PresenterOrchestrator:
                     self._tts_active = False
                     self._current_notes_words = set()
             else:
-                logger.info("Non-question interruption — resuming shortly")
+                logger.info("Interruption — answer_questions_immediately is off, resuming")
         finally:
             await self.slide_ctrl.resume()
             self._answering.set()  # allow presentation loop to continue
