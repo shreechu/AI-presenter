@@ -87,7 +87,8 @@ class PresenterOrchestrator:
         self._shutdown = asyncio.Event()
         self._answering = asyncio.Event()  # set while Q&A is in progress
         self._answering.set()  # starts in "not answering" state (set = clear to proceed)
-        self._tts_active = False  # True while TTS is playing (echo suppression)
+        self._tts_active = False  # True while TTS is playing
+        self._current_notes_words: set[str] = set()  # words of the notes being spoken (echo detection)
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -177,6 +178,7 @@ class PresenterOrchestrator:
             # Speak the notes
             if slide.speaker_notes:
                 _status("[Speaking notes...]")
+                self._current_notes_words = set(slide.speaker_notes.lower().split())
                 self._tts_active = True
                 try:
                     await self.tts.speak(slide.speaker_notes)
@@ -184,6 +186,7 @@ class PresenterOrchestrator:
                     logger.exception("TTS playback failed on slide %d", slide.index)
                 finally:
                     self._tts_active = False
+                    self._current_notes_words = set()
 
             # Wait for any in-progress Q&A to finish before advancing
             await self._answering.wait()
@@ -219,10 +222,19 @@ class PresenterOrchestrator:
                 logger.exception("Error handling transcript")
 
     async def _handle_transcript(self, transcript: AudioTranscript) -> None:
-        # Echo suppression — ignore mic input while TTS is playing through speakers
-        if self._tts_active:
-            logger.debug("Ignoring transcript (TTS active): %s", transcript.text[:60])
+        # Echo suppression — if TTS is playing, check whether the transcript is
+        # just the mic picking up the bot's own voice (echo) vs. a real person.
+        # High word-overlap with the current speaker notes → echo → discard.
+        if self._tts_active and self._is_echo(transcript.text):
+            logger.debug("Ignoring echo: %s", transcript.text[:80])
             return
+
+        # If we get here while TTS is active, it's a genuine interruption —
+        # stop speaking immediately so the audience can be heard.
+        if self._tts_active:
+            self.tts.stop_playback()
+            self._tts_active = False
+            logger.info("TTS interrupted by audience speech")
 
         event = await self.detector.process_async(transcript.speaker, transcript.text)
         _status(f"[Speech: {event.speaker}] {event.text}")
@@ -259,6 +271,7 @@ class PresenterOrchestrator:
                 await self.teams.post_chat_message(f"A: {answer}")
 
                 _status(f"[Answer] {answer}")
+                self._current_notes_words = set(answer.lower().split())
                 self._tts_active = True
                 try:
                     await self.tts.speak(answer)
@@ -266,12 +279,29 @@ class PresenterOrchestrator:
                     logger.exception("TTS failed while answering")
                 finally:
                     self._tts_active = False
+                    self._current_notes_words = set()
             else:
                 logger.info("Non-question interruption — resuming shortly")
         finally:
             await self.slide_ctrl.resume()
             self._answering.set()  # allow presentation loop to continue
             _status("[RESUMED]")
+
+    # ── Echo detection ─────────────────────────────────────────────────────────
+
+    def _is_echo(self, text: str) -> bool:
+        """Return True if *text* is likely the mic picking up the bot's own TTS.
+
+        Compares word overlap between the transcript and the speaker notes
+        currently being spoken.  High overlap → echo.
+        """
+        if not self._current_notes_words:
+            return False
+        words = set(text.lower().split())
+        if not words:
+            return True  # empty → nothing useful
+        overlap = len(words & self._current_notes_words) / len(words)
+        return overlap > 0.5
 
     # ── Command execution ─────────────────────────────────────────────────────
 
