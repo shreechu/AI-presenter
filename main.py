@@ -87,8 +87,6 @@ class PresenterOrchestrator:
         self._shutdown = asyncio.Event()
         self._answering = asyncio.Event()  # set while Q&A is in progress
         self._answering.set()  # starts in "not answering" state (set = clear to proceed)
-        self._tts_active = False  # True while TTS is playing
-        self._current_notes_words: set[str] = set()  # words of the notes being spoken (echo detection)
         self._interrupted = False  # set by _handle_transcript when it stops TTS
 
     # ── Run ───────────────────────────────────────────────────────────────────
@@ -176,19 +174,17 @@ class PresenterOrchestrator:
             # Notify Teams chat about current slide
             await self.teams.post_slide_highlight(slide.index, slide.title)
 
-            # Speak the notes
+            # Speak the notes (mute STT to prevent echo feedback loop)
             if slide.speaker_notes:
                 _status("[Speaking notes...]")
-                self._current_notes_words = set(slide.speaker_notes.lower().split())
-                self._tts_active = True
+                self.audio.mute()
                 self._interrupted = False
                 try:
                     await self.tts.speak(slide.speaker_notes)
                 except Exception:
                     logger.exception("TTS playback failed on slide %d", slide.index)
                 finally:
-                    self._tts_active = False
-                    self._current_notes_words = set()
+                    self.audio.unmute()
 
             # If TTS was interrupted by audience speech, yield so the
             # audio-consumer task can clear _answering and pause us.
@@ -230,27 +226,17 @@ class PresenterOrchestrator:
                 logger.exception("Error handling transcript")
 
     async def _handle_transcript(self, transcript: AudioTranscript) -> None:
-        # Echo suppression — if TTS is playing, check whether the transcript is
-        # just the mic picking up the bot's own voice (echo) vs. a real person.
-        # High word-overlap with the current speaker notes → echo → discard.
-        if self._tts_active and self._is_echo(transcript.text):
-            logger.debug("Ignoring echo: %s", transcript.text[:80])
-            return
-
         # Track whether WE triggered the _answering block (so we know to
         # release it in every exit path below).
         we_blocked = False
 
-        # If we get here while TTS is active, it's a genuine interruption —
-        # stop speaking immediately so the audience can be heard.
-        # Clear _answering NOW so the presentation loop blocks until Q&A is
-        # done (the LLM classification below can take seconds).
-        if self._tts_active:
+        # If TTS is still playing (e.g. mute failed or Teams chat source),
+        # stop it immediately for a genuine interruption.
+        if self.tts.is_speaking:
             self._interrupted = True  # signal presentation loop to yield
             self._answering.clear()   # block presentation loop immediately
             we_blocked = True
             self.tts.stop_playback()
-            self._tts_active = False
             logger.info("TTS interrupted by audience speech")
 
         try:
@@ -292,15 +278,13 @@ class PresenterOrchestrator:
                 await self.teams.post_chat_message(f"A: {answer}")
 
                 _status(f"[Answer] {answer}")
-                self._current_notes_words = set(answer.lower().split())
-                self._tts_active = True
+                self.audio.mute()
                 try:
                     await self.tts.speak(answer)
                 except Exception:
                     logger.exception("TTS failed while answering")
                 finally:
-                    self._tts_active = False
-                    self._current_notes_words = set()
+                    self.audio.unmute()
             else:
                 logger.info("Interruption — answer_questions_immediately is off, resuming")
 
@@ -311,21 +295,6 @@ class PresenterOrchestrator:
             if we_blocked:
                 self._answering.set()
 
-    # ── Echo detection ─────────────────────────────────────────────────────────
-
-    def _is_echo(self, text: str) -> bool:
-        """Return True if *text* is likely the mic picking up the bot's own TTS.
-
-        Compares word overlap between the transcript and the speaker notes
-        currently being spoken.  High overlap → echo.
-        """
-        if not self._current_notes_words:
-            return False
-        words = set(text.lower().split())
-        if not words:
-            return True  # empty → nothing useful
-        overlap = len(words & self._current_notes_words) / len(words)
-        return overlap > 0.5
 
     # ── Command execution ─────────────────────────────────────────────────────
 

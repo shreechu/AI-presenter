@@ -37,11 +37,29 @@ class AudioListener:
     def __init__(self, config: AudioConfig) -> None:
         self._cfg = config
         self._queue: asyncio.Queue[AudioTranscript] = asyncio.Queue()
+        self._muted = False  # when True, recognized speech is silently discarded
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def mute(self) -> None:
+        """Suppress incoming transcripts (echo suppression while TTS plays)."""
+        self._muted = True
+        # Drain any already-queued transcripts so they don't fire after unmute
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def unmute(self) -> None:
+        """Resume processing incoming transcripts."""
+        self._muted = False
+
     async def push_transcript(self, transcript: AudioTranscript) -> None:
         """Inject a transcript event (used by Teams bot, simulation, or mic pipeline)."""
+        if self._muted:
+            logger.debug("Muted — dropping transcript: %s", transcript.text[:60])
+            return
         await self._queue.put(transcript)
 
     async def stream_transcripts(self) -> AsyncIterator[AudioTranscript]:
