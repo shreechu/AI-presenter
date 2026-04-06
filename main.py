@@ -87,6 +87,7 @@ class PresenterOrchestrator:
         self._shutdown = asyncio.Event()
         self._answering = asyncio.Event()  # set while Q&A is in progress
         self._answering.set()  # starts in "not answering" state (set = clear to proceed)
+        self._tts_active = False  # True while TTS is playing (echo suppression)
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
@@ -176,10 +177,13 @@ class PresenterOrchestrator:
             # Speak the notes
             if slide.speaker_notes:
                 _status("[Speaking notes...]")
+                self._tts_active = True
                 try:
                     await self.tts.speak(slide.speaker_notes)
                 except Exception:
                     logger.exception("TTS playback failed on slide %d", slide.index)
+                finally:
+                    self._tts_active = False
 
             # Wait for any in-progress Q&A to finish before advancing
             await self._answering.wait()
@@ -215,6 +219,11 @@ class PresenterOrchestrator:
                 logger.exception("Error handling transcript")
 
     async def _handle_transcript(self, transcript: AudioTranscript) -> None:
+        # Echo suppression — ignore mic input while TTS is playing through speakers
+        if self._tts_active:
+            logger.debug("Ignoring transcript (TTS active): %s", transcript.text[:60])
+            return
+
         event = await self.detector.process_async(transcript.speaker, transcript.text)
         _status(f"[Speech: {event.speaker}] {event.text}")
 
@@ -250,10 +259,13 @@ class PresenterOrchestrator:
                 await self.teams.post_chat_message(f"A: {answer}")
 
                 _status(f"[Answer] {answer}")
+                self._tts_active = True
                 try:
                     await self.tts.speak(answer)
                 except Exception:
                     logger.exception("TTS failed while answering")
+                finally:
+                    self._tts_active = False
             else:
                 logger.info("Non-question interruption — resuming shortly")
         finally:

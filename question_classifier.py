@@ -44,16 +44,21 @@ QUESTION_WORDS = frozenset(
 _COMMAND_MAP: dict[str, str] = {
     "next slide": "next",
     "go forward": "next",
-    "advance": "next",
+    "advance slide": "next",
     "previous slide": "back",
     "go back": "back",
-    "last slide": "back",
-    "pause": "pause",
-    "stop": "pause",
-    "resume": "resume",
-    "continue": "resume",
-    "skip": "next",
+    "go to previous": "back",
+    "pause presentation": "pause",
+    "stop presenting": "pause",
+    "resume presentation": "resume",
+    "continue presenting": "resume",
+    "skip slide": "next",
 }
+
+# Maximum word count for an utterance to be considered a command.
+# Real commands are short ("next slide", "go back"); longer sentences
+# that happen to contain those phrases are NOT commands.
+_COMMAND_MAX_WORDS = 5
 
 _FEEDBACK_STARTERS = frozenset(
     "thanks thank ok okay got it understood sure great good nice".split()
@@ -72,16 +77,19 @@ class QuestionClassifier:
 
         lowered = normalized.lower()
 
-        # 1. Check for navigation / control commands first
-        for trigger, cmd in _COMMAND_MAP.items():
-            if trigger in lowered:
-                return ClassificationResult(
-                    intent=Intent.COMMAND,
-                    is_question=False,
-                    confidence=0.95,
-                    reason=f"matched_command:{trigger}",
-                    command=cmd,
-                )
+        # 1. Check for navigation / control commands
+        # Only match if the utterance is short (likely a deliberate command)
+        words = lowered.split()
+        if len(words) <= _COMMAND_MAX_WORDS:
+            for trigger, cmd in _COMMAND_MAP.items():
+                if trigger in lowered:
+                    return ClassificationResult(
+                        intent=Intent.COMMAND,
+                        is_question=False,
+                        confidence=0.95,
+                        reason=f"matched_command:{trigger}",
+                        command=cmd,
+                    )
 
         # 2. Question scoring
         score = 0.0
