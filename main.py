@@ -237,42 +237,51 @@ class PresenterOrchestrator:
             logger.debug("Ignoring echo: %s", transcript.text[:80])
             return
 
+        # Track whether WE triggered the _answering block (so we know to
+        # release it in every exit path below).
+        we_blocked = False
+
         # If we get here while TTS is active, it's a genuine interruption —
         # stop speaking immediately so the audience can be heard.
+        # Clear _answering NOW so the presentation loop blocks until Q&A is
+        # done (the LLM classification below can take seconds).
         if self._tts_active:
             self._interrupted = True  # signal presentation loop to yield
+            self._answering.clear()   # block presentation loop immediately
+            we_blocked = True
             self.tts.stop_playback()
             self._tts_active = False
             logger.info("TTS interrupted by audience speech")
 
-        event = await self.detector.process_async(transcript.speaker, transcript.text)
-        _status(f"[Speech: {event.speaker}] {event.text}")
-
-        if not event.is_interruption:
-            return
-
-        intent = event.classification.intent
-
-        # ── Command handling ──────────────────────────────────────────────────
-        if intent == Intent.COMMAND:
-            await self._handle_command(event.classification)
-            return
-
-        # ── Feedback (acknowledge and continue) ──────────────────────────────
-        if intent == Intent.FEEDBACK:
-            logger.info("Feedback received: %s", event.text)
-            return
-
-        # ── Question or unknown interruption → pause ─────────────────────────
-        self._answering.clear()  # signal presentation loop to wait
-        await self.slide_ctrl.pause()
-        self.tts.stop_playback()
-        _status("[PAUSED] for interruption")
-
         try:
-            # Treat both explicit questions AND unknown interruptions as
-            # questions worth answering — a human presenter would respond
-            # to any audience speech, not just perfectly-formed questions.
+            event = await self.detector.process_async(transcript.speaker, transcript.text)
+            _status(f"[Speech: {event.speaker}] {event.text}")
+
+            if not event.is_interruption:
+                return
+
+            intent = event.classification.intent
+
+            # ── Command handling ──────────────────────────────────────────────
+            if intent == Intent.COMMAND:
+                await self._handle_command(event.classification)
+                return
+
+            # ── Feedback (acknowledge and continue) ──────────────────────────
+            if intent == Intent.FEEDBACK:
+                logger.info("Feedback received: %s", event.text)
+                return
+
+            # ── Question or unknown interruption → pause & answer ─────────────
+            if not we_blocked:
+                self._answering.clear()
+                we_blocked = True
+            await self.slide_ctrl.pause()
+            self.tts.stop_playback()
+            _status("[PAUSED] for interruption")
+
+            # Treat all interruptions as questions worth answering — a human
+            # presenter would respond to any audience speech.
             if self.config.detection.answer_questions_immediately:
                 _status("[Generating answer...]")
                 answer = await self._answer_question(event.text)
@@ -294,10 +303,13 @@ class PresenterOrchestrator:
                     self._current_notes_words = set()
             else:
                 logger.info("Interruption — answer_questions_immediately is off, resuming")
-        finally:
+
             await self.slide_ctrl.resume()
-            self._answering.set()  # allow presentation loop to continue
             _status("[RESUMED]")
+        finally:
+            # Always unblock the presentation loop if we blocked it
+            if we_blocked:
+                self._answering.set()
 
     # ── Echo detection ─────────────────────────────────────────────────────────
 
