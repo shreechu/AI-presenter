@@ -58,7 +58,11 @@ class TTSEngine:
         return self._stop.is_set() or self._gen != gen
 
     async def speak(self, text: str) -> None:
-        """Convert *text* to audio and play it.  Blocks until done or stopped."""
+        """Convert *text* to audio and play it.  Blocks until done or stopped.
+
+        Sends the entire text as a single SSML utterance so the neural voice
+        produces natural, flowing prosody across sentences.
+        """
         gen = self._gen  # snapshot — if stop_playback() bumps this, we abort
         self._stop.clear()
         self._speaking = True
@@ -151,32 +155,29 @@ class TTSEngine:
         self._azure_synthesizer = synthesizer  # stop_playback() calls stop_speaking_async()
 
         voice = self._cfg.voice
-        sentences = _split_sentences(text)
         loop = asyncio.get_running_loop()
-        try:
-            for sentence in sentences:
-                if self._cancelled(gen):
-                    logger.info("TTS stopped (Azure)")
-                    break
-                logger.info("[TTS Azure] %s", sentence)
 
-                ssml = _build_ssml(sentence, voice)
-                try:
-                    result = await loop.run_in_executor(
-                        None, synthesizer.speak_ssml_async(ssml).get
-                    )
-                except Exception:
-                    if self._cancelled(gen):
-                        logger.info("TTS stopped mid-sentence (Azure)")
-                        break
-                    raise
+        # Build a single SSML document for the full text so the neural voice
+        # produces natural, flowing prosody across all sentences.
+        ssml = _build_full_ssml(text, voice)
+        logger.info("[TTS Azure] Speaking %d chars as single utterance", len(text))
+
+        try:
+            try:
+                result = await loop.run_in_executor(
+                    None, synthesizer.speak_ssml_async(ssml).get
+                )
+            except Exception:
                 if self._cancelled(gen):
-                    logger.info("TTS stopped after sentence (Azure)")
-                    break
-                if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
-                    logger.error("Azure TTS failed: %s — %s", result.reason,
-                                 result.cancellation_details.reason if result.cancellation_details else "")
-                    break
+                    logger.info("TTS stopped mid-utterance (Azure)")
+                    return
+                raise
+            if self._cancelled(gen):
+                logger.info("TTS stopped (Azure)")
+                return
+            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                logger.error("Azure TTS failed: %s — %s", result.reason,
+                             result.cancellation_details.reason if result.cancellation_details else "")
         finally:
             self._azure_synthesizer = None
 
@@ -254,7 +255,7 @@ class TTSEngine:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Voices that support the "friendly" express-as style
+# Voices that support mstts:express-as styles
 _STYLE_VOICES = frozenset({
     "en-US-AriaNeural",
     "en-US-JennyNeural",
@@ -268,6 +269,46 @@ _STYLE_VOICES = frozenset({
     "en-US-EmmaMultilingualNeural",
     "en-US-BrianMultilingualNeural",
 })
+
+
+def _build_full_ssml(text: str, voice: str) -> str:
+    """Build a single SSML document for the entire text.
+
+    Wraps sentences in ``<s>`` elements inside a ``<p>`` paragraph so the
+    neural voice produces natural cross-sentence prosody — the same way
+    a human presenter reads an entire paragraph rather than isolated
+    sentences.
+    """
+    import re
+    import xml.sax.saxutils as saxutils
+
+    # Split into sentences but keep them in one SSML utterance
+    raw_sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s for s in raw_sentences if s]
+
+    use_style = voice in _STYLE_VOICES
+
+    # Build sentence-tagged content
+    s_tags = "\n".join(f"      <s>{saxutils.escape(s)}</s>" for s in sentences)
+    paragraph = f"    <p>\n{s_tags}\n    </p>"
+
+    if use_style:
+        inner = (
+            f'    <mstts:express-as style="chat" styledegree="2">\n'
+            f'{paragraph}\n'
+            f'    </mstts:express-as>'
+        )
+    else:
+        inner = paragraph
+
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">\n'
+        f'  <voice name="{voice}">\n'
+        f'{inner}\n'
+        f'  </voice>\n'
+        f'</speak>'
+    )
 
 
 def _build_ssml(text: str, voice: str) -> str:
@@ -285,7 +326,6 @@ def _build_ssml(text: str, voice: str) -> str:
 
     inner = safe_text
     if use_style:
-        # "chat" sounds the most natural for presentation narration
         inner = (
             f'<mstts:express-as style="chat" styledegree="1.2">'
             f'{safe_text}'
